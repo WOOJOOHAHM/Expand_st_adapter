@@ -19,12 +19,15 @@ try:
 except ImportError:
   from .load_binary import load_binary
 
+from sklearn.preprocessing import LabelEncoder
+label_encoder = LabelEncoder()
+
 class VideoDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        list_path: str,
-        data_root: str,
+        dataframe,
+        train_valid_test,
         num_frames: int = 8,
         sampling_rate: int = 0,
         spatial_size: int = 224,
@@ -41,7 +44,6 @@ class VideoDataset(torch.utils.data.Dataset):
         scale_range: Tuple[float, float] = (0.08, 1.0),
         random_erasing: Optional[RandomErasing] = None,
     ):
-        self.data_root = data_root
         self.interpolation = interpolation
         self.spatial_size = spatial_size
         self.load_labels = load_labels
@@ -70,23 +72,17 @@ class VideoDataset(torch.utils.data.Dataset):
             self.num_temporal_views = num_temporal_views
             self.num_spatial_views = num_spatial_views
 
-        with open(list_path) as f:
-            self.data_list = f.read().splitlines()
-
-
+        self.dataframe = dataframe[dataframe['type'] == train_valid_test].reset_index()
+        self.dataframe['encoded_label'] = label_encoder.fit_transform(self.dataframe['label'])
     def __len__(self):
-        return len(self.data_list)
+        return len(self.dataframe)
     
 
     def __getitem__(self, idx):
-        line = self.data_list[idx]
-        if self.load_labels:
-            path, label = line.split(' ')
-            label = int(label)
-        else:
-            path = line.split(' ')[0] # the list can be with or without labels
-            label = None
-        path = os.path.join(self.data_root, path)
+    
+        path = self.dataframe['video_path'][idx]
+        label = self.dataframe['encoded_label'][idx]
+        # path = os.path.join(self.data_root, path)
 
         raw_data = load_binary(path)
         container = av.open(io.BytesIO(raw_data))
@@ -160,13 +156,13 @@ class VideoDataset(torch.utils.data.Dataset):
 
             frames = self._generate_spatial_crops(frames)
             frames = sum([self._generate_temporal_crops(x) for x in frames], [])
-            if len(frames) > 1:
+            if len(frames) >= 1:
                 frames = torch.stack(frames)
 
             if self.random_erasing is not None:
                 raise NotImplementedError('random erasing in non-random sample mode is'
                     'not supported.')
-
+            
         if label is None:
             return frames
         else:
