@@ -236,12 +236,9 @@ def load_model(args, model_without_ddp, optimizer, lr_sched, loss_scaler):
   return 0
 
 def save_model(args, epoch, model_without_ddp, optimizer, lr_sched, loss_scaler):
-  if dist.get_rank() == 0 and ((epoch + 1) % args.save_freq == 0 or (epoch + 1) == args.epochs):
+  if ((epoch + 1) % args.save_freq == 0 or (epoch + 1) == args.epochs): #dist.get_rank() == 0 and ((epoch + 1) % args.save_freq == 0 or (epoch + 1) == args.epochs):
     os.makedirs(args.save_dir, exist_ok=True)
     state_dict = model_without_ddp.state_dict()
-    for n, p in model_without_ddp.named_parameters():
-      if not p.requires_grad:
-        del state_dict[n]
     torch.save({
       'model': state_dict,
       'optimizer': optimizer.state_dict(),

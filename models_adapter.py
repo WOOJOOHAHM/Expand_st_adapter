@@ -28,10 +28,10 @@ class Adapter(nn.Module):
             groups=adapter_channels,
         )
         self.fc2 = nn.Linear(adapter_channels, in_channels)
-        nn.init.constant_(self.conv.weight, 0.)
-        nn.init.constant_(self.conv.bias, 0.)
-        nn.init.constant_(self.fc1.bias, 0.)
-        nn.init.constant_(self.fc2.bias, 0.)
+        nn.init.constant_(self.conv.weight, 0.).half()
+        nn.init.constant_(self.conv.bias, 0.).half()
+        nn.init.constant_(self.fc1.bias, 0.).half()
+        nn.init.constant_(self.fc2.bias, 0.).half()
 
     def forward(self, x, T):
         BT, L, C = x.size()
@@ -54,6 +54,56 @@ class Adapter(nn.Module):
         x_id[:, 1:, :] += x
         return x_id
 
+
+class expand_tubevit(nn.Module):
+    def __init__(self, scale, width):
+        super(expand_tubevit, self).__init__()
+        self.spatial_start_point = [45, 48, 87, 90]
+        self.patch_size = [3, 5, 7, 9]
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+
+    def get_patch_index(self, x, spatial_point, patch_size):
+        if patch_size == 3:
+            sp = spatial_point
+        elif patch_size == 5:
+            sp = spatial_point - 15
+        elif patch_size == 7:
+            sp = spatial_point - (15 * 2)
+        elif patch_size == 9:
+            sp = spatial_point - (15 * 3)
+
+        patch_gap = (patch_size + 1) // 2
+        additional_pathes = [sp, sp+patch_gap, sp+(patch_gap*2),
+                                sp+(14 * patch_gap), sp+(14*patch_gap)+((patch_gap*2)),
+                                sp+(14 * patch_gap*2), sp+(14 * patch_gap*2)+patch_gap, sp+(14 * patch_gap*2)+(patch_gap*2)]
+        center_patch = [(14 * i) + sp + j + 1 for j in range(patch_size) for i in range(0, patch_size)] # j: 각 patch를 grid하게 탐색, i: 각 patch의 시작 point를 찾음
+        selected_patch = additional_pathes + center_patch
+        selected_patch.sort()
+        selected_patch = torch.index_select(x.cpu(), 0, torch.tensor(selected_patch)).cuda()
+        return selected_patch
+    
+    def forward(self, x):
+        expand_tube = torch.empty(0, x.size(1), x.size(2), x.size(3)).cuda()
+
+        for batch in range(x.size(0)):
+            tube = torch.empty(0, x.size(2), x.size(3)).cuda()
+            for frame_idx in range(x.size(1)):
+                # 현재 프레임 선택
+                distribute_frame = frame_idx % 4
+                if distribute_frame == 0:
+                    for spatial_point in self.spatial_start_point:
+                        st_tube = torch.empty(0,768).cuda()
+                        for i, idx in enumerate(range(frame_idx, frame_idx+4 , 1)):
+                            current_frame = x[batch, idx, :, :]
+                            selected_frame = self.get_patch_index(current_frame, spatial_point, self.patch_size[i])
+                            st_tube = torch.cat([st_tube, selected_frame], dim=0)
+                        st_tube = st_tube.unsqueeze(0)
+                        tube = torch.cat([tube, st_tube], dim=0)
+                else:
+                    pass
+            tube = tube.unsqueeze(0)
+            expand_tube = torch.cat([expand_tube, tube], dim=0)
+        return expand_tube
 
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
@@ -159,7 +209,7 @@ class Transformer(nn.Module):
         return x
 
 
-class VisionTransformer(nn.Module):
+class expand_st_adapter(nn.Module):
     def __init__(self,
                  input_resolution: int,
                  patch_size: int,
@@ -172,6 +222,114 @@ class VisionTransformer(nn.Module):
                  adapter_kernel_size: Tuple[int, int, int],
                  adapter_pre_attn: bool,
                  adapter_pre_mlp: bool,
+                 classifier: str,
+                 testing=None
+                 ):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width,
+            kernel_size=patch_size, stride=patch_size, bias=False)
+
+        scale = width ** -0.5
+        
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        
+        self.spatial_positional_embedding = nn.Parameter(
+            scale * torch.randn(
+                (input_resolution // patch_size) ** 2 , width
+            )
+        )
+
+        self.temporal_positional_embedding = nn.Parameter(
+            scale * torch.randn(
+                8, ((input_resolution // patch_size) ** 2) * width
+            )
+        )
+        self.ln_pre = LayerNorm(width)
+
+        self.transformer = Transformer(width, layers, heads,
+            adapter_width, adapter_layers, adapter_kernel_size,
+            adapter_pre_attn, adapter_pre_mlp)
+        self.expand_tubevit = expand_tubevit(scale, width)
+
+        for n, p in self.named_parameters():
+          if 'adapter' not in n:
+            p.requires_grad_(True)
+            p.data = p.data.half()
+        
+        self.dropout = nn.Dropout(0.5)
+
+        self.classifier = classifier
+        if self.classifier == 'mean' or self.classifier == 'difference':
+            self.expand_fc = nn.Linear(width, num_classes)
+            self.ln_expand_post = LayerNorm(width)
+        elif self.classifier == 'span2':
+            self.expand_fc = nn.Linear(width * 2, num_classes)
+            self.ln_expand_post = LayerNorm(width * 2)
+        nn.init.normal_(self.expand_fc.weight, std=0.02)
+        nn.init.constant_(self.expand_fc.bias, 0.)
+
+        self.testing = testing
+
+    def forward(self, x: torch.Tensor):
+        B, T = x.size(0), x.size(2)
+        x = x.permute(0, 2, 1, 3, 4).flatten(0, 1)
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        spatial_size = tuple(x.size()[2:])
+        x = x.flatten(-2).permute(0, 2, 1)
+        x = x + self.spatial_positional_embedding.to(x.dtype)
+        x = x.contiguous().view(B, T, spatial_size[0] * spatial_size[1], x.size(-1))
+    
+        # Temporal positional embedding
+        S_patch, embedded_patch = x.size(2), x.size(3)
+        x = x.view(x.size(0), x.size(1), -1)
+        x = x + self.temporal_positional_embedding.to(x.dtype)
+        x = x.contiguous().view(B, T, S_patch, embedded_patch)
+
+        # Expand tube vit
+        x = self.expand_tubevit(x)
+        x = x.flatten(0, 1)
+        x = torch.cat([
+            self.class_embedding.view(1, 1, -1).expand(x.shape[0], -1, -1), x
+            ], dim=1)  # [*, grid ** 2 + 1, width]
+        
+        x = self.ln_pre(x)
+        x = self.transformer(x, T)
+
+        x = x.contiguous().view(B, T, spatial_size[0] * spatial_size[1] + 1, x.size(-1))
+        if self.testing is not None:
+            new_tensor = torch.cat([x[:, i, 0, :] for i in range(x.size(1))], dim=0)
+        # St_adapter의 방식으로 모든 것을 평균내버리는 방식
+        if self.classifier == 'mean':
+            x = x[:, :, 0, :].mean(dim=1)
+        elif self.classifier == 'span2':
+            x = torch.stack((x[:, 0:T//2, 0, :].mean(dim=1), x[:, T//2:, 0, :].mean(dim=1))).view(B, x.size()[3] * 2)
+        elif self.classifier == 'difference':
+            x = x[:, 0:T//2, 0, :].mean(dim=1) - x[:, T//2:, 0, :].mean(dim=1)
+        x = self.ln_expand_post(x)
+        x = self.dropout(x)
+        x = self.expand_fc(x)
+
+        if self.testing is not None:
+            return x, new_tensor
+        else:
+            return x
+
+
+class st_adapter_VIT(nn.Module):
+    def __init__(self,
+                 input_resolution: int,
+                 patch_size: int,
+                 width: int,
+                 layers: int,
+                 heads: int,
+                 num_classes: int,
+                 adapter_width: int,
+                 adapter_layers: int,
+                 adapter_kernel_size: Tuple[int, int, int],
+                 adapter_pre_attn: bool,
+                 adapter_pre_mlp: bool,
+                 testing=None
                  ):
         super().__init__()
         self.input_resolution = input_resolution
@@ -195,7 +353,7 @@ class VisionTransformer(nn.Module):
 
         for n, p in self.named_parameters():
           if 'adapter' not in n:
-            p.requires_grad_(False)
+            p.requires_grad_(True)
             p.data = p.data.half()
         
         self.dropout = nn.Dropout(0.5)
@@ -203,7 +361,7 @@ class VisionTransformer(nn.Module):
         nn.init.normal_(self.fc.weight, std=0.02)
         nn.init.constant_(self.fc.bias, 0.)
 
-
+        self.testing = testing
     def forward(self, x: torch.Tensor):
         B, T = x.size(0), x.size(2)
         x = x.permute(0, 2, 1, 3, 4).flatten(0, 1)
@@ -221,17 +379,22 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x, T)
 
         x = x.contiguous().view(B, T, spatial_size[0] * spatial_size[1] + 1, x.size(-1))
+        if self.testing is not None:
+            new_tensor = torch.cat([x[:, i, 0, :] for i in range(x.size(1))], dim=0)
         x = x[:, :, 0, :].mean(dim=1)
-
         x = self.ln_post(x)
         x = self.dropout(x)
         x = self.fc(x)
+        
+        if self.testing is not None:
+            return x, new_tensor
+        else:
+            return x
 
-        return x
 
-
-def clip_vit_base_patch16_adapter24x384(**kwargs):
-    model = VisionTransformer(
+def clip_vit_base_patch16_adapter24x384(model_name, classifier=None, **kwargs):
+    if model_name == 'st_adapter':
+        model = st_adapter_VIT(
         input_resolution=224,
         patch_size=16,
         width=768,
@@ -244,28 +407,60 @@ def clip_vit_base_patch16_adapter24x384(**kwargs):
         adapter_pre_mlp=True,
         **kwargs,
     )
+    
+    elif model_name == 'expand_st_adapter':
+        model = expand_st_adapter(
+            input_resolution=224,
+            patch_size=16,
+            width=768,
+            layers=12,
+            heads=12,
+            adapter_width=384,
+            adapter_layers=12,
+            adapter_kernel_size=(3, 1, 1),
+            adapter_pre_attn=True,
+            adapter_pre_mlp=True,
+            classifier=classifier,
+            **kwargs,
+        )
     assert CLIP_VIT_B16_PATH is not None, \
         'Please set CLIP_VIT_B16_PATH in configs.py.'
-    checkpoint = torch.jit.load(CLIP_VIT_B16_PATH, map_location='cpu')
+    checkpoint = torch.jit.load('/hahmwj/ViT-B-16.pt', map_location='cpu')
     print(model.load_state_dict(checkpoint.visual.state_dict(), strict=False))
     return model
 
-def clip_vit_base_patch16_adapter12x384(**kwargs):
-    model = VisionTransformer(
-        input_resolution=224,
-        patch_size=16,
-        width=768,
-        layers=12,
-        heads=12,
-        adapter_width=384,
-        adapter_layers=12,
-        adapter_kernel_size=(3, 1, 1),
-        adapter_pre_attn=False,
-        adapter_pre_mlp=True,
-        **kwargs,
-    )
+def clip_vit_base_patch16_adapter12x384(model_name, classifier=None, **kwargs):
+    if model_name == 'st_adapter':
+        model = st_adapter_VIT(
+            input_resolution=224,
+            patch_size=16,
+            width=768,
+            layers=12,
+            heads=12,
+            adapter_width=384,
+            adapter_layers=12,
+            adapter_kernel_size=(3, 1, 1),
+            adapter_pre_attn=False,
+            adapter_pre_mlp=True,
+            **kwargs,
+        )
+    elif model_name == 'expand_st_adapter':
+        model = expand_st_adapter(
+            input_resolution=224,
+            patch_size=16,
+            width=768,
+            layers=12,
+            heads=12,
+            adapter_width=384,
+            adapter_layers=12,
+            adapter_kernel_size=(3, 1, 1),
+            adapter_pre_attn=False,
+            adapter_pre_mlp=True,
+            classifier = classifier,
+            **kwargs,
+        )
     assert CLIP_VIT_B16_PATH is not None, \
         'Please set CLIP_VIT_B16_PATH in configs.py'
-    checkpoint = torch.jit.load(CLIP_VIT_B16_PATH, map_location='cpu')
+    checkpoint = torch.jit.load('/hahmwj/ViT-B-16.pt', map_location='cpu')
     print(model.load_state_dict(checkpoint.visual.state_dict(), strict=False))
     return model

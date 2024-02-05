@@ -16,21 +16,8 @@ from configs import DATASETS
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('--model', type=str, help='expand_st_adapter, st_adapter')
+  parser.add_argument('--model_name', type=str, help='expand_st_adapter, st_adapter')
   parser.add_argument('--classifier', type=str, help='mean, span2')
-  parser.add_argument('--batch_size', type=int, default=16,
-      help='batch size per gpu')
-  parser.add_argument('--blr', type=float, default=1e-3,
-      help='base learning rate per 256 samples. actual base learning rate is linearly scaled '
-           'based on batch size.')
-  parser.add_argument('--lr', type=float,
-      help='constant base learning rate. overrides the --blr option.')
-  parser.add_argument('--weight_decay', type=float, default=1e-2,
-      help='optimizer weight decay.')
-  parser.add_argument('--epochs', type=int, default=10,
-      help='number of training epochs.')
-  parser.add_argument('--warmup_epochs', type=int, default=2,
-      help='number of warmup epochs.')
   parser.add_argument('--eval_only', action='store_true',
       help='only run evaluation.')
 
@@ -84,17 +71,14 @@ def main():
   # gpu_id = dist.get_rank() % torch.cuda.device_count()
   # torch.cuda.set_device(gpu_id)
   # setup_for_distributed(dist.get_rank() == 0)
-
-  print("{}".format(args).replace(', ', ',\n'))
-  args.save_dir = args.save_dir + args.model + '_' + args.classifier + '/' + args.dataset
+  if args.classifier:
+    args.save_dir = args.save_dir + args.model_name + '_' + args.classifier + '/' + args.dataset
+  else:
+    args.save_dir = args.save_dir + args.model_name + '/' + args.dataset
   print('creating model')
-  print(args.model)
-  model = models_adapter.clip_vit_base_patch16_adapter12x384(args.model, args.classifier, num_classes=DATASETS[args.dataset]['NUM_CLASSES']).cuda().train()
+  print(args.model_name)
+  model = models_adapter.clip_vit_base_patch16_adapter12x384(args.model_name, args.classifier, num_classes=DATASETS[args.dataset]['NUM_CLASSES']).cuda().train()
   n_trainable_params = 0
-  for n, p in model.named_parameters():
-    if p.requires_grad:
-      print('Trainable param: %s, %s, %s' % (n, p.size(), p.dtype))
-      n_trainable_params += p.numel()
   print('Total trainable params:', n_trainable_params, '(%.2f M)' % (n_trainable_params / 1000000))
   # model = torch.nn.parallel.DistributedDataParallel(model)
   # model_without_ddp = model.module
@@ -114,23 +98,9 @@ def main():
     dataframe = pd.read_csv('/hahmwj/csv_files/k400.csv')
 
   print('creating dataset')
-  if not args.eval_only:
-    dataset_train = VideoDataset(
-        dataframe,
-        'train',
-        random_sample=True,
-        mirror=args.mirror,
-        spatial_size=args.spatial_size,
-        auto_augment=args.auto_augment,
-        num_frames=args.num_frames,
-        sampling_rate=args.sampling_rate,
-        resize_type=args.resize_type,
-        scale_range=args.scale_range,
-        )
-    print('train dataset:', dataset_train)
-  dataset_val = VideoDataset(
+  dataset_test = VideoDataset(
       dataframe,
-        'valid',
+        'test',
       random_sample=False,
       spatial_size=args.spatial_size,
       num_frames=args.num_frames,
@@ -138,67 +108,23 @@ def main():
       num_spatial_views=args.num_spatial_views,
       num_temporal_views=args.num_temporal_views,
       )
-  print('val dataset:', dataset_val)
-
-  if not args.eval_only:
-    dataloader_train = torch.utils.data.DataLoader(
-        dataset_train,
-        batch_size=args.batch_size,
-        # sampler=torch.utils.data.DistributedSampler(dataset_train),
-        num_workers=args.num_workers,
-        pin_memory=True,
-        )
-  dataloader_val = torch.utils.data.DataLoader(
+  print('Test dataset:', dataset_test)
+  dataloader_test = torch.utils.data.DataLoader(
       # torch.utils.data.Subset(dataset_val, range(dist.get_rank(), len(dataset_val), dist.get_world_size())),
-      dataset_val,
+      dataset_test,
       batch_size=1,
       shuffle=False,
       num_workers=args.num_workers,
       pin_memory=True,
       )
-
-  if args.eval_only:
-    optimizer = None
-    loss_scaler = None
-    lr_sched = None
-  else:
-    if args.lr is not None:
-      print('using absolute lr:', args.lr)
-    else:
-      print('using relative lr (per 256 samples):', args.blr)
-      args.lr = args.blr * args.batch_size /256  #dist.get_world_size() / 256
-      print('effective lr:', args.lr)
-    
-    params_with_decay, params_without_decay = [], []
-    for n, p in model.named_parameters():
-      if not p.requires_grad:
-        continue
-      if '.bias' in n:
-        params_without_decay.append(p)
-      else:
-        params_with_decay.append(p)
-    optimizer = torch.optim.AdamW(
-        [
-          {'params': params_with_decay, 'lr': args.lr, 'weight_decay': args.weight_decay},
-          {'params': params_without_decay, 'lr': args.lr, 'weight_decay': 0.}
-        ],
-        )
-    print(optimizer)
-    loss_scaler = torch.cuda.amp.GradScaler()
-    
-    def lr_func(step):
-      epoch = step / len(dataloader_train)
-      if epoch < args.warmup_epochs:
-        return epoch / args.warmup_epochs
-      else:
-        return 0.5 + 0.5 * math.cos((epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs) * math.pi)
-    lr_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_func)
-
+  weight_path = f'/hahmwj/expand_tube_st_adapter/trained_weight/{args.model_name}/{args.dataset}/checkpoint-99.pth'
+  checkpoint = torch.load(weight_path, map_location='cpu')['model']
+  model.load_state_dict(checkpoint, strict=False)
   def evaluate(log_stats=None):
     metric_logger = MetricLogger(delimiter="  ")
     header = 'Test:'
     model.eval()
-    for data, labels in metric_logger.log_every(dataloader_val, 100, header):
+    for data, labels in metric_logger.log_every(dataloader_test, 100, header):
       data, labels = data.cuda(), labels.cuda()
       B, V = data.size(0), data.size(1)
       data = data.flatten(0, 1)
@@ -217,59 +143,6 @@ def main():
         .format(top1=metric_logger.acc1, top5=metric_logger.acc5))
     if log_stats is not None:
       log_stats.update({'val_' + k: meter.global_avg for k, meter in metric_logger.meters.items()})
-
-  start_epoch = load_model(args, model, optimizer, lr_sched, loss_scaler)
-
-  if args.eval_only:
-    evaluate()
-    return
-
-  for epoch in range(start_epoch, args.epochs):
-    # dataloader_train.sampler.set_epoch(epoch)
-    metric_logger = MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-
-    model.train()
-    for step, (data, labels) in enumerate(metric_logger.log_every(dataloader_train, args.print_freq, header)):
-      data, labels = data.cuda(), labels.cuda()
-      optimizer.zero_grad()
-      with torch.cuda.amp.autocast():
-        logits = model(data)
-        acc1 = (logits.topk(1, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
-        acc5 = (logits.topk(5, dim=1)[1] == labels.view(-1, 1)).sum(dim=-1).float().mean().item() * 100
-        loss = F.cross_entropy(logits, labels)
-      loss_scaler.scale(loss).backward()
-      loss_scaler.step(optimizer)
-      lr_sched.step()
-      loss_scaler.update()
-
-      metric_logger.update(
-          loss=loss.item(),
-          lr=optimizer.param_groups[0]['lr'],
-          acc1=acc1, acc5=acc5,
-          )
-
-    print('Averaged stats:', metric_logger)
-    log_stats = {'train_' + k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-    save_model(args, epoch, model, optimizer, lr_sched, loss_scaler)
-
-    if (epoch + 1) % args.eval_freq == 0 or (epoch + 1) == args.epochs:
-      evaluate(log_stats)
-
-
-    if args.save_dir is not None: # and dist.get_rank() == 0:
-      n_total_params, n_trainable_params = 0, 0
-      for n, p in model.named_parameters():
-        n_total_params += p.numel()
-        if p.requires_grad:
-          n_trainable_params += p.numel()
-      log_stats['epoch'] = epoch
-      log_stats['n_trainable_params'] = n_trainable_params
-      log_stats['n_total_params'] = n_total_params
-      with open(os.path.join(args.save_dir, 'log.txt'), 'a') as f:
-        f.write(json.dumps(log_stats) + '\n')
-
-
+  
+  evaluate()
 if __name__ == '__main__': main()
